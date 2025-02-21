@@ -1,8 +1,6 @@
 package main
 
 import (
-	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -11,15 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"cloud.google.com/go/storage"
-	"google.golang.org/api/option"
 )
 
 const (
 	numChannels   = 1 // Mono audio
 	sampleRate    = 16000
 	bitsPerSample = 16 // 16 bits per sample
+
+	storagePath = "audio/"
 )
 
 // CreateWAVHeader generates a WAV header for the given data length
@@ -47,61 +44,6 @@ func createWAVHeader(dataLength int) []byte {
 	return header
 }
 
-func uploadFileToGCS(bucketName string, fileName string, filePath string) error {
-	ctx := context.Background()
-
-	// Create a storage client using the service account credentials from the environment variable
-	credsEnv := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-	if credsEnv == "" {
-		return fmt.Errorf("GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable is not set")
-	}
-
-	// Decode the base64 encoded credentials
-	creds, err := base64.StdEncoding.DecodeString(credsEnv)
-	if err != nil {
-		return fmt.Errorf("failed to decode credentials: %v", err)
-	}
-
-	// Create a temporary file for the credentials
-	credsFile, err := os.CreateTemp("", "gcs-creds-*.json")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file for credentials: %v", err)
-	}
-	defer os.Remove(credsFile.Name())
-
-	if _, err := credsFile.Write(creds); err != nil {
-		return fmt.Errorf("failed to write credentials to temp file: %v", err)
-	}
-	credsFile.Close()
-
-	// Create a storage client
-	client, err := storage.NewClient(ctx, option.WithCredentialsFile(credsFile.Name()))
-	if err != nil {
-		return fmt.Errorf("failed to create storage client: %v", err)
-	}
-	defer client.Close()
-
-	bucket := client.Bucket(bucketName)
-	f, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to open file: %v", err)
-	}
-	defer f.Close()
-
-	wc := bucket.Object(fileName).NewWriter(ctx)
-	wc.ContentType = "audio/wav"
-
-	if _, err = io.Copy(wc, f); err != nil {
-		return fmt.Errorf("failed to write to bucket: %v", err)
-	}
-	if err := wc.Close(); err != nil {
-		return fmt.Errorf("failed to close Writer: %v", err)
-	}
-
-	log.Printf("File %s uploaded to GCS bucket %s successfully.", fileName, bucketName)
-	return nil
-}
-
 func handlePostAudio(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	sampleRateParam := query.Get("sample_rate")
@@ -126,36 +68,26 @@ func handlePostAudio(w http.ResponseWriter, r *http.Request) {
 		currentTime.Minute(),
 		currentTime.Second())
 
-	tempFilePath := filepath.Join(os.TempDir(), filename)
-
 	header := createWAVHeader(len(body))
 
-	// Write to temporary file
-	tempFile, err := os.Create(tempFilePath)
+	storageFilePath := filepath.Join(storagePath, filename)
+	f, err := os.Create(storageFilePath)
 	if err != nil {
-		log.Printf("Failed to create temp file: %v", err)
-		http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+		log.Printf("Failed to create file: %v", err)
+		http.Error(w, "Failed to create file", http.StatusInternalServerError)
 		return
 	}
-	defer tempFile.Close()
+	defer f.Close()
 
 	// Write WAV header and audio data
-	tempFile.Write(header)
-	tempFile.Write(body)
-
-	// Get bucket name from environment variable
-	bucketName := os.Getenv("GCS_BUCKET_NAME")
-	if bucketName == "" {
-		log.Printf("GCS_BUCKET_NAME environment variable is not set")
-		http.Error(w, "GCS_BUCKET_NAME environment variable is not set", http.StatusInternalServerError)
+	if _, err := f.Write(header); err != nil {
+		log.Printf("Failed to write WAV header: %v", err)
+		http.Error(w, "Failed to write WAV header", http.StatusInternalServerError)
 		return
 	}
-
-	// Upload the file to Google Cloud Storage
-	err = uploadFileToGCS(bucketName, filename, tempFilePath)
-	if err != nil {
-		log.Printf("Failed to upload to GCS: %v", err)
-		http.Error(w, "Failed to upload to Google Cloud Storage", http.StatusInternalServerError)
+	if _, err := f.Write(body); err != nil {
+		log.Printf("Failed to write audio data: %v", err)
+		http.Error(w, "Failed to write audio data", http.StatusInternalServerError)
 		return
 	}
 
